@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+credentials.json
+*.json.bak
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
