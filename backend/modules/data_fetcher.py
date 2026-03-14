@@ -180,11 +180,18 @@ class NSEDataFetcher:
                         data = resp.json()
                         if isinstance(data, dict) and data:
                             return data
+                        elif isinstance(data, dict) and not data:
+                            # Empty dict {} — valid response, no data available
+                            # (common on weekends/holidays when market is closed)
+                            logger.info(
+                                f"NSE returned empty JSON from {url} "
+                                "(market may be closed — weekend/holiday)"
+                            )
+                            return None  # Don't retry, session is fine
                         else:
                             logger.warning(
-                                f"NSE returned empty/invalid JSON from {url}: "
-                                f"type={type(data).__name__}, "
-                                f"keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}"
+                                f"NSE returned unexpected JSON from {url}: "
+                                f"type={type(data).__name__}"
                             )
                     except ValueError as e:
                         logger.error(
