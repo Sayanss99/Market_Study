@@ -130,7 +130,7 @@ class NSEDataFetcher:
                 logger.warning(f"NSE homepage returned {resp.status_code}")
                 return False
 
-            cookie_names = [c.name for c in session.cookies]
+            cookie_names = list(session.cookies.keys())
             logger.info(f"NSE homepage OK, cookies: {cookie_names}")
 
             # Small delay to mimic human behavior
