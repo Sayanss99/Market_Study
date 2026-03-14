@@ -3,15 +3,16 @@ NSE India Data Fetcher
 Scrapes live option chain data, India VIX, Nifty spot price, and indices
 from NSE India API endpoints with proper session/cookie handling.
 
-Uses requests.Session (not httpx) because NSE's anti-bot detection is tuned
-to block httpx's TLS fingerprint. requests.Session with proper headers and
-cookie flow is the proven approach used by all major NSE scraping libraries
-(nsepython, nselib, NseIndiaApi).
+Uses curl_cffi which impersonates Chrome's exact TLS fingerprint at the
+handshake level. NSE uses Akamai Bot Manager which does deep TLS
+fingerprinting — both httpx and requests get blocked because their TLS
+stacks are recognizably different from real browsers. curl_cffi solves
+this by using curl-impersonate under the hood.
 
 The async interface is preserved via asyncio.to_thread() wrappers.
 """
 
-import requests
+from curl_cffi import requests as curl_requests
 import asyncio
 import logging
 import time
@@ -26,38 +27,6 @@ NSE_BASE = "https://www.nseindia.com"
 NSE_OPTION_CHAIN_PAGE = "https://www.nseindia.com/option-chain"
 NSE_OPTION_CHAIN_API = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
 NSE_ALL_INDICES = "https://www.nseindia.com/api/allIndices"
-
-# Headers for initial page visit (mimics opening Chrome and typing a URL)
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-              "image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-}
-
-# Headers for XHR/API calls (after cookies are set)
-API_HEADERS = {
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Referer": "https://www.nseindia.com/option-chain",
-    "X-Requested-With": "XMLHttpRequest",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
 
 
 @dataclass
@@ -105,23 +74,23 @@ class MarketSnapshot:
 
 
 class NSEDataFetcher:
-    """Handles all data fetching from NSE India using requests.Session.
+    """Handles all data fetching from NSE India using curl_cffi.
 
-    Uses requests (synchronous) instead of httpx because NSE's anti-bot
-    detection reliably passes requests.Session but blocks httpx.
+    curl_cffi impersonates Chrome's TLS fingerprint at the handshake level,
+    which bypasses Akamai Bot Manager's deep TLS fingerprinting that blocks
+    both httpx and requests.
 
     Session flow:
-    1. Create requests.Session with browser headers
-    2. GET homepage → acquire cookies (nseappid, nsit, etc.)
+    1. Create curl_cffi session with impersonate="chrome131"
+    2. GET homepage → acquire cookies (nseappid, nsit, ak_bmsc, etc.)
     3. GET option-chain page → warm session
-    4. GET API endpoints with XHR headers → get JSON data
+    4. GET API endpoints → get JSON data
 
-    All public methods are async (via asyncio.to_thread) so the FastAPI
-    event loop is not blocked.
+    All public methods are async (via asyncio.to_thread).
     """
 
     def __init__(self):
-        self._session: Optional[requests.Session] = None
+        self._session: Optional[curl_requests.Session] = None
         self._cookies_valid = False
         self._session_init_count = 0
         self._last_fetch: Optional[datetime] = None
@@ -129,24 +98,22 @@ class NSEDataFetcher:
         self._last_expiry_dates: List[str] = []
         self._last_selected_expiry: str = ""
 
-    def _create_session(self) -> requests.Session:
-        """Create a fresh requests.Session with browser headers."""
+    def _create_session(self) -> curl_requests.Session:
+        """Create a fresh curl_cffi session impersonating Chrome 131."""
         if self._session:
             self._session.close()
 
-        session = requests.Session()
-        session.headers.update(BROWSER_HEADERS)
-        self._session = session
+        self._session = curl_requests.Session(impersonate="chrome131")
         self._cookies_valid = False
-        return session
+        return self._session
 
-    def _get_session(self) -> requests.Session:
+    def _get_session(self) -> curl_requests.Session:
         if self._session is None:
             return self._create_session()
         return self._session
 
     def _init_session_sync(self) -> bool:
-        """Synchronous session initialization: homepage → option-chain page."""
+        """Session initialization: homepage → option-chain page."""
         self._session_init_count += 1
 
         if self._session_init_count > 3:
@@ -157,14 +124,13 @@ class NSEDataFetcher:
         try:
             session = self._get_session()
 
-            # Step 1: Hit the homepage with browser headers to get cookies
-            session.headers.update(BROWSER_HEADERS)
+            # Step 1: Hit the homepage to get cookies
             resp = session.get(NSE_BASE, timeout=15)
             if resp.status_code != 200:
                 logger.warning(f"NSE homepage returned {resp.status_code}")
                 return False
 
-            cookie_names = list(session.cookies.keys())
+            cookie_names = [c.name for c in session.cookies]
             logger.info(f"NSE homepage OK, cookies: {cookie_names}")
 
             # Small delay to mimic human behavior
@@ -183,38 +149,33 @@ class NSEDataFetcher:
             self._session_init_count = 0
             return True
 
-        except requests.exceptions.ConnectTimeout:
-            logger.error("Connection timeout reaching NSE — check your internet")
-            return False
         except Exception as e:
             logger.error(f"Failed to initialize NSE session: {e}")
             return False
 
     def _fetch_json_sync(self, url: str, retries: int = 3) -> Optional[Dict]:
-        """Synchronous JSON fetch from NSE API with retry logic."""
+        """Fetch JSON from NSE API with retry logic."""
         session = self._get_session()
 
         for attempt in range(retries):
             if not self._cookies_valid:
                 if not self._init_session_sync():
                     wait = 2 ** attempt + random.uniform(0, 1)
-                    logger.info(f"Session init failed, waiting {wait:.1f}s before retry...")
+                    logger.info(f"Session init failed, waiting {wait:.1f}s...")
                     time.sleep(wait)
                     continue
 
             try:
-                # Use API headers for XHR calls (session retains cookies)
-                resp = session.get(url, headers=API_HEADERS, timeout=15)
+                resp = session.get(url, timeout=15)
 
                 if resp.status_code == 200:
-                    # Check if response is actually JSON
                     content_type = resp.headers.get("Content-Type", "")
                     if "json" not in content_type and "javascript" not in content_type:
                         logger.warning(
                             f"NSE returned non-JSON Content-Type: {content_type} "
                             f"(first 200 chars: {resp.text[:200]})"
                         )
-                        # Still try to parse — sometimes Content-Type is wrong
+
                     try:
                         data = resp.json()
                         if isinstance(data, dict) and data:
@@ -231,7 +192,6 @@ class NSEDataFetcher:
                             f"(first 300 chars: {resp.text[:300]})"
                         )
 
-                    # JSON parse failed or empty — invalidate session and retry
                     self._cookies_valid = False
                     time.sleep(1 + random.uniform(0, 1))
                     continue
@@ -247,8 +207,6 @@ class NSEDataFetcher:
                 else:
                     logger.warning(f"NSE API {url} returned {resp.status_code}")
 
-            except requests.exceptions.ReadTimeout:
-                logger.warning(f"Timeout fetching {url}, attempt {attempt + 1}/{retries}")
             except Exception as e:
                 logger.error(f"Error fetching {url}: {e}")
 
@@ -270,7 +228,6 @@ class NSEDataFetcher:
 
         target_expiry = expiry or (expiry_dates[0] if expiry_dates else None)
 
-        # Store for fetch_full_snapshot
         self._last_expiry_dates = expiry_dates
         self._last_selected_expiry = target_expiry or ""
 
@@ -364,7 +321,6 @@ class NSEDataFetcher:
         snapshot = MarketSnapshot()
 
         try:
-            # Ensure session is initialized before any API calls
             if not self._cookies_valid:
                 if not self._init_session_sync():
                     logger.error("Could not establish NSE session")
@@ -374,16 +330,13 @@ class NSEDataFetcher:
                     snapshot.error = "Could not establish NSE session"
                     return snapshot
 
-            # Fetch option chain first (also extracts expiry dates)
             chain = self._fetch_option_chain_sync(expiry)
             snapshot.option_chain = chain
             snapshot.expiry_dates = self._last_expiry_dates
             snapshot.selected_expiry = self._last_selected_expiry
 
-            # Delay between API calls
             time.sleep(random.uniform(0.5, 1.0))
 
-            # Fetch indices
             indices = self._fetch_indices_sync()
             snapshot.indices = indices
 
