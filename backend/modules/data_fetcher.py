@@ -132,6 +132,8 @@ class NSEDataFetcher:
         self._session_init_count = 0
         self._last_fetch: Optional[datetime] = None
         self._cached_snapshot: Optional[MarketSnapshot] = None
+        self._last_expiry_dates: List[str] = []
+        self._last_selected_expiry: str = ""
 
     async def _create_client(self) -> httpx.AsyncClient:
         """Create a fresh HTTP client with browser-like settings."""
@@ -242,7 +244,11 @@ class NSEDataFetcher:
         return None
 
     async def fetch_option_chain(self, expiry: Optional[str] = None) -> Dict[float, OptionChainRow]:
-        """Fetch the full NIFTY option chain from NSE."""
+        """Fetch the full NIFTY option chain from NSE.
+
+        Also populates self._last_expiry_dates and self._last_selected_expiry
+        so fetch_full_snapshot doesn't need a second API call.
+        """
         data = await self._fetch_json(NSE_OPTION_CHAIN_API)
         if not data:
             logger.error("Failed to fetch option chain data")
@@ -255,6 +261,10 @@ class NSEDataFetcher:
 
         # Use nearest expiry if none specified
         target_expiry = expiry or (expiry_dates[0] if expiry_dates else None)
+
+        # Store for fetch_full_snapshot to use without a second API call
+        self._last_expiry_dates = expiry_dates
+        self._last_selected_expiry = target_expiry or ""
 
         chain: Dict[float, OptionChainRow] = {}
 
@@ -341,17 +351,35 @@ class NSEDataFetcher:
         return value, change_pct
 
     async def fetch_full_snapshot(self, expiry: Optional[str] = None) -> MarketSnapshot:
-        """Fetch a complete market snapshot: option chain + all indices."""
+        """Fetch a complete market snapshot: option chain + all indices.
+
+        Fetches sequentially (not concurrently) to avoid session/cookie
+        conflicts — both calls share the same httpx client and cookies.
+        """
         snapshot = MarketSnapshot()
 
         try:
-            # Fetch option chain and indices concurrently
-            chain_task = self.fetch_option_chain(expiry)
-            indices_task = self.fetch_indices()
+            # Ensure session is initialized before any API calls
+            if not self._cookies_valid:
+                if not await self._init_session():
+                    logger.error("Could not establish NSE session")
+                    if self._cached_snapshot:
+                        self._cached_snapshot.is_stale = True
+                        return self._cached_snapshot
+                    snapshot.error = "Could not establish NSE session"
+                    return snapshot
 
-            chain, indices = await asyncio.gather(chain_task, indices_task)
-
+            # Fetch option chain first (also extracts expiry dates)
+            chain = await self.fetch_option_chain(expiry)
             snapshot.option_chain = chain
+            snapshot.expiry_dates = self._last_expiry_dates
+            snapshot.selected_expiry = self._last_selected_expiry
+
+            # Small delay between API calls to avoid rate limiting
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+
+            # Fetch indices next
+            indices = await self.fetch_indices()
             snapshot.indices = indices
 
             if indices:
@@ -363,15 +391,6 @@ class NSEDataFetcher:
                 vix, vix_change = self._extract_vix(indices)
                 snapshot.india_vix = vix
                 snapshot.india_vix_change_pct = vix_change
-
-            # Get expiry dates from option chain API
-            oc_data = await self._fetch_json(NSE_OPTION_CHAIN_API)
-            if oc_data:
-                records = oc_data.get("records", {})
-                snapshot.expiry_dates = records.get("expiryDates", [])
-                snapshot.selected_expiry = expiry or (
-                    snapshot.expiry_dates[0] if snapshot.expiry_dates else ""
-                )
 
             snapshot.timestamp = datetime.now()
             self._last_fetch = snapshot.timestamp
