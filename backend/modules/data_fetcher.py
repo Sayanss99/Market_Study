@@ -2,11 +2,18 @@
 NSE India Data Fetcher
 Scrapes live option chain data, India VIX, Nifty spot price, and indices
 from NSE India API endpoints with proper session/cookie handling.
+
+NSE aggressively blocks non-browser requests. This module uses:
+- Realistic Chrome 131 headers with sec-ch-ua, sec-fetch-* headers
+- Two-step cookie acquisition: homepage → option-chain page → API
+- Random delays between requests to avoid rate limiting
+- Session rotation on repeated 403s
 """
 
 import httpx
 import asyncio
 import logging
+import random
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
@@ -14,21 +21,53 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 NSE_BASE = "https://www.nseindia.com"
-NSE_OPTION_CHAIN = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+NSE_OPTION_CHAIN_PAGE = "https://www.nseindia.com/option-chain"
+NSE_OPTION_CHAIN_API = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
 NSE_ALL_INDICES = "https://www.nseindia.com/api/allIndices"
 
-HEADERS = {
+# Full browser-like headers that NSE expects (Chrome 131 on Windows 10)
+BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+# Headers for XHR/API calls (after cookies are set)
+API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
     "Referer": "https://www.nseindia.com/option-chain",
     "X-Requested-With": "XMLHttpRequest",
     "Connection": "keep-alive",
+    "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
 
 
@@ -77,37 +116,89 @@ class MarketSnapshot:
 
 
 class NSEDataFetcher:
-    """Handles all data fetching from NSE India with cookie/session management."""
+    """Handles all data fetching from NSE India with cookie/session management.
+
+    NSE requires a two-step flow:
+    1. Visit the homepage with full browser headers → acquire session cookies
+    2. Visit the option-chain page → warm the session for API access
+    3. Hit the JSON API endpoints with XHR-style headers + cookies
+
+    If 403 persists, the session is destroyed and recreated from scratch.
+    """
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
         self._cookies_valid = False
+        self._session_init_count = 0
         self._last_fetch: Optional[datetime] = None
         self._cached_snapshot: Optional[MarketSnapshot] = None
 
+    async def _create_client(self) -> httpx.AsyncClient:
+        """Create a fresh HTTP client with browser-like settings."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+        self._client = httpx.AsyncClient(
+            headers=BROWSER_HEADERS,
+            timeout=httpx.Timeout(30.0, connect=15.0),
+            follow_redirects=True,
+            verify=True,
+            http2=False,
+        )
+        self._cookies_valid = False
+        return self._client
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                headers=HEADERS,
-                timeout=httpx.Timeout(30.0, connect=10.0),
-                follow_redirects=True,
-                verify=True,
-            )
-            self._cookies_valid = False
+            return await self._create_client()
         return self._client
 
     async def _init_session(self) -> bool:
-        """Hit NSE homepage to get cookies before API calls."""
+        """Two-step session initialization: homepage → option-chain page.
+
+        This mimics a real user opening Chrome, navigating to nseindia.com,
+        and then clicking on the Option Chain page.
+        """
+        self._session_init_count += 1
+
+        # After 3 failed inits, destroy and recreate the client entirely
+        if self._session_init_count > 3:
+            logger.warning("Multiple session init failures, creating fresh client...")
+            await self._create_client()
+            self._session_init_count = 1
+
         try:
             client = await self._get_client()
+
+            # Step 1: Hit the homepage with full browser headers
+            client.headers.update(BROWSER_HEADERS)
             resp = await client.get(NSE_BASE)
-            if resp.status_code == 200:
-                self._cookies_valid = True
-                logger.info("NSE session initialized, cookies acquired.")
-                return True
-            else:
+            if resp.status_code != 200:
                 logger.warning(f"NSE homepage returned {resp.status_code}")
                 return False
+
+            logger.info("NSE homepage OK, cookies acquired.")
+
+            # Small random delay to mimic human behavior
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+            # Step 2: Visit the option-chain page (sets additional cookies)
+            resp = await client.get(NSE_OPTION_CHAIN_PAGE)
+            if resp.status_code != 200:
+                logger.warning(f"NSE option-chain page returned {resp.status_code}")
+                # Still try API — sometimes the page 403s but API works
+            else:
+                logger.info("NSE option-chain page OK, session warmed.")
+
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+
+            self._cookies_valid = True
+            self._session_init_count = 0
+            return True
+
+        except httpx.ConnectTimeout:
+            logger.error("Connection timeout reaching NSE — check your internet")
+            return False
         except Exception as e:
             logger.error(f"Failed to initialize NSE session: {e}")
             return False
@@ -119,31 +210,40 @@ class NSEDataFetcher:
         for attempt in range(retries):
             if not self._cookies_valid:
                 if not await self._init_session():
-                    await asyncio.sleep(2 ** attempt)
+                    wait = 2 ** attempt + random.uniform(0, 1)
+                    logger.info(f"Session init failed, waiting {wait:.1f}s before retry...")
+                    await asyncio.sleep(wait)
                     continue
 
             try:
+                # Switch to API headers for XHR calls (keeps cookies from client)
+                client.headers.update(API_HEADERS)
                 resp = await client.get(url)
+
                 if resp.status_code == 200:
                     return resp.json()
                 elif resp.status_code in (401, 403):
-                    logger.warning("NSE session expired, re-initializing...")
+                    logger.warning(
+                        f"NSE API returned {resp.status_code} on attempt {attempt + 1}, "
+                        "re-initializing session..."
+                    )
                     self._cookies_valid = False
+                    await asyncio.sleep(1 + random.uniform(0, 1))
                     continue
                 else:
                     logger.warning(f"NSE API {url} returned {resp.status_code}")
             except httpx.ReadTimeout:
-                logger.warning(f"Timeout fetching {url}, attempt {attempt + 1}")
+                logger.warning(f"Timeout fetching {url}, attempt {attempt + 1}/{retries}")
             except Exception as e:
                 logger.error(f"Error fetching {url}: {e}")
 
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** attempt + random.uniform(0, 1))
 
         return None
 
     async def fetch_option_chain(self, expiry: Optional[str] = None) -> Dict[float, OptionChainRow]:
         """Fetch the full NIFTY option chain from NSE."""
-        data = await self._fetch_json(NSE_OPTION_CHAIN)
+        data = await self._fetch_json(NSE_OPTION_CHAIN_API)
         if not data:
             logger.error("Failed to fetch option chain data")
             return {}
@@ -265,7 +365,7 @@ class NSEDataFetcher:
                 snapshot.india_vix_change_pct = vix_change
 
             # Get expiry dates from option chain API
-            oc_data = await self._fetch_json(NSE_OPTION_CHAIN)
+            oc_data = await self._fetch_json(NSE_OPTION_CHAIN_API)
             if oc_data:
                 records = oc_data.get("records", {})
                 snapshot.expiry_dates = records.get("expiryDates", [])

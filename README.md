@@ -789,15 +789,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### NSE data returns empty
+### NSE returns 403 Forbidden
 
 ```
-ERROR: Failed to fetch option chain data
+WARNING:backend.modules.data_fetcher:NSE homepage returned 403
+ERROR:backend.modules.data_fetcher:Failed to fetch option chain data
 ```
-**Fix:** NSE blocks requests without proper session cookies. The scraper handles this automatically, but if NSE is down or blocking:
-- Wait a few minutes and retry
-- Check if `https://www.nseindia.com` is accessible from your server
-- NSE may block cloud IPs; running locally usually works
+
+NSE India aggressively blocks non-browser requests. The scraper uses a two-step session flow (homepage → option-chain page → API) with realistic Chrome headers, but 403s can still happen.
+
+**Fixes to try (in order):**
+1. **Wait and retry** — NSE rate-limits aggressively. The scraper auto-retries with exponential backoff. Give it 2-3 refresh cycles (6-9 minutes).
+2. **Check market hours** — NSE APIs work most reliably during trading hours (9:15 AM - 3:30 PM IST, Mon-Fri). Outside hours, the APIs may be less responsive.
+3. **Check your IP** — NSE may block cloud/VPN/datacenter IPs. Running from a residential ISP connection (like your home WiFi) usually works.
+4. **Try from a browser first** — Open `https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY` in Chrome. If this works in Chrome but not in the app, it's a header/cookie issue.
+5. **Restart the server** — This creates a fresh HTTP session: `Ctrl+C` then `python run.py`.
+6. **Check firewall/antivirus** — Some corporate firewalls or antivirus software block outbound HTTPS to NSE.
 
 ### Google Sheets "Permission denied"
 
